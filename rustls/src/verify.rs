@@ -427,7 +427,7 @@ pub fn verify_client_cert_signed_by_trust_anchor(
     cert: &ParsedCertificate,
     roots: &RootCertStore,
     intermediates: &[Certificate],
-    now: SystemTime
+    now: SystemTime,
 ) -> Result<(), Error> {
     let chain = intermediate_chain(intermediates);
     let trust_roots = trust_roots(roots);
