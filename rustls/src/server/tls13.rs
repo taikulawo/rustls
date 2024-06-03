@@ -388,6 +388,8 @@ mod client_hello {
                         ocsp_response,
                     );
                 }
+                // server private key 签名
+                // client 将用证书的public key验签
                 emit_certificate_verify_tls13(
                     &mut self.transcript,
                     cx.common,
@@ -810,6 +812,7 @@ mod client_hello {
         signing_key: &dyn sign::SigningKey,
         schemes: &[SignatureScheme],
     ) -> Result<(), Error> {
+        // 逐渐将之前handshake的数据进行hash累加
         let message = construct_server_verify_message(&transcript.current_hash());
 
         let signer = signing_key
@@ -822,6 +825,8 @@ mod client_hello {
             })?;
 
         let scheme = signer.scheme();
+        // 对以往过程的hash签名，作为TLS1.3 Certificate Verify message发到client
+        // keyless的offload需要将sign异步化
         let sig = signer.sign(&message)?;
 
         let cv = DigitallySignedStruct::new(scheme, sig);
