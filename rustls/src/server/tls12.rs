@@ -412,6 +412,7 @@ mod client_hello {
             .choose_scheme(&sigschemes)
             .ok_or_else(|| Error::General("incompatible signing key".to_string()))?;
         let sigscheme = signer.scheme();
+        // keyless
         let sig = signer.sign(&msg)?;
 
         let skx = ServerKeyExchangePayload::from(ServerKeyExchange {
