@@ -15,7 +15,8 @@ use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
-use crate::client::{tls13, ClientConfig};
+use crate::client::ech::EchState;
+use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
 use crate::common_state::{CommonState, HandshakeKind, State};
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -45,7 +46,6 @@ fn find_session(
     config: &ClientConfig,
     cx: &mut ClientContext<'_>,
 ) -> Option<persist::Retrieved<ClientSessionValue>> {
-    #[allow(clippy::let_and_return, clippy::unnecessary_lazy_evaluations)]
     let found = config
         .resumption
         .store
@@ -114,24 +114,26 @@ pub(super) fn start_handshake(
         None
     };
 
-    #[cfg_attr(not(feature = "tls12"), allow(unused_mut))]
-    let mut session_id = None;
-    if let Some(_resuming) = &mut resuming {
-        #[cfg(feature = "tls12")]
-        if let ClientSessionValue::Tls12(inner) = &mut _resuming.value {
-            // If we have a ticket, we use the sessionid as a signal that
-            // we're  doing an abbreviated handshake.  See section 3.4 in
-            // RFC5077.
-            if !inner.ticket().is_empty() {
-                inner.session_id = SessionId::random(config.provider.secure_random)?;
-            }
-            session_id = Some(inner.session_id);
-        }
-
+    let session_id = if let Some(_resuming) = &mut resuming {
         debug!("Resuming session");
+
+        match &mut _resuming.value {
+            #[cfg(feature = "tls12")]
+            ClientSessionValue::Tls12(inner) => {
+                // If we have a ticket, we use the sessionid as a signal that
+                // we're  doing an abbreviated handshake.  See section 3.4 in
+                // RFC5077.
+                if !inner.ticket().is_empty() {
+                    inner.session_id = SessionId::random(config.provider.secure_random)?;
+                }
+                Some(inner.session_id)
+            }
+            _ => None,
+        }
     } else {
         debug!("Not resuming any session");
-    }
+        None
+    };
 
     // https://tools.ietf.org/html/rfc8446#appendix-D.4
     // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
@@ -145,7 +147,20 @@ pub(super) fn start_handshake(
     let random = Random::new(config.provider.secure_random)?;
     let extension_order_seed = crate::rand::random_u16(config.provider.secure_random)?;
 
-    Ok(emit_client_hello_for_retry(
+    let ech_state = match config.ech_mode.as_ref() {
+        Some(EchMode::Enable(ech_config)) => Some(EchState::new(
+            ech_config,
+            server_name.clone(),
+            config
+                .client_auth_cert_resolver
+                .has_certs(),
+            config.provider.secure_random,
+            config.enable_sni,
+        )?),
+        _ => None,
+    };
+
+    emit_client_hello_for_retry(
         transcript_buffer,
         None,
         key_share,
@@ -161,9 +176,11 @@ pub(super) fn start_handshake(
             hello: ClientHelloDetails::new(extension_order_seed),
             session_id,
             server_name,
+            prev_ech_ext: None,
         },
         cx,
-    ))
+        ech_state,
+    )
 }
 
 struct ExpectServerHello {
@@ -172,6 +189,7 @@ struct ExpectServerHello {
     early_key_schedule: Option<KeyScheduleEarly>,
     offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
     suite: Option<SupportedCipherSuite>,
+    ech_state: Option<EchState>,
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -189,6 +207,7 @@ struct ClientHelloInput {
     hello: ClientHelloDetails,
     session_id: SessionId,
     server_name: ServerName<'static>,
+    prev_ech_ext: Option<ClientExtension>,
 }
 
 fn emit_client_hello_for_retry(
@@ -199,9 +218,13 @@ fn emit_client_hello_for_retry(
     suite: Option<SupportedCipherSuite>,
     mut input: ClientHelloInput,
     cx: &mut ClientContext<'_>,
-) -> NextState<'static> {
+    mut ech_state: Option<EchState>,
+) -> NextStateOrError<'static> {
     let config = &input.config;
-    let support_tls12 = config.supports_version(ProtocolVersion::TLSv1_2) && !cx.common.is_quic();
+    // Defense in depth: the ECH state should be None if ECH is disabled based on config
+    // builder semantics.
+    let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
+    let support_tls12 = config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12;
     let support_tls13 = config.supports_version(ProtocolVersion::TLSv1_3);
 
     let mut supported_versions = Vec::new();
@@ -247,10 +270,24 @@ fn emit_client_hello_for_retry(
         ));
     }
 
-    if let (ServerName::DnsName(dns), true) = (&input.server_name, config.enable_sni) {
-        // We only want to send the SNI extension if the server name contains a DNS name.
-        exts.push(ClientExtension::make_sni(dns));
-    }
+    match (ech_state.as_ref(), config.enable_sni) {
+        // If we have ECH state we have a "cover name" to send in the outer hello
+        // as the SNI domain name. This happens unconditionally so we ignore the
+        // `enable_sni` value. That will be used later to decide what to do for
+        // the protected inner hello's SNI.
+        (Some(ech_state), _) => exts.push(ClientExtension::make_sni(&ech_state.outer_name)),
+
+        // If we have no ECH state, and SNI is enabled, try to use the input server_name
+        // for the SNI domain name.
+        (None, true) => {
+            if let ServerName::DnsName(dns_name) = &input.server_name {
+                exts.push(ClientExtension::make_sni(dns_name))
+            }
+        }
+
+        // If we have no ECH state, and SNI is not enabled, there's nothing to do.
+        (None, false) => {}
+    };
 
     if let Some(key_share) = &key_share {
         debug_assert!(support_tls13);
@@ -296,16 +333,30 @@ fn emit_client_hello_for_retry(
     // Extra extensions must be placed before the PSK extension
     exts.extend(extra_exts.iter().cloned());
 
+    // If this is a second client hello we're constructing in response to an HRR, and
+    // we've rejected ECH or sent GREASE ECH, then we need to carry forward the
+    // exact same ECH extension we used in the first hello.
+    if matches!(cx.data.ech_status, EchStatus::Rejected | EchStatus::Grease) & retryreq.is_some() {
+        if let Some(prev_ech_ext) = input.prev_ech_ext.take() {
+            exts.push(prev_ech_ext);
+        }
+    }
+
     // Do we have a SessionID or ticket cached for this host?
     let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
     exts.sort_by_cached_key(|new_ext| {
-        // PSK extension is always last
-        if let ClientExtension::PresharedKey(..) = new_ext {
-            return u32::MAX;
-        }
+        match (&cx.data.ech_status, new_ext) {
+            // When not offering ECH/GREASE, the PSK extension is always last.
+            (EchStatus::NotOffered, ClientExtension::PresharedKey(..)) => return u32::MAX,
+            // When ECH or GREASE are in-play, the ECH extension is always last.
+            (_, ClientExtension::EncryptedClientHello(_)) => return u32::MAX,
+            // ... and the PSK extension should be second-to-last.
+            (_, ClientExtension::PresharedKey(..)) => return u32::MAX - 1,
+            _ => {}
+        };
 
         let seed = (input.hello.extension_order_seed as u32) << 16
             | (u16::from(new_ext.ext_type()) as u32);
@@ -314,12 +365,6 @@ fn emit_client_hello_for_retry(
             key => key,
         }
     });
-
-    // Note what extensions we sent.
-    input.hello.sent_extensions = exts
-        .iter()
-        .map(ClientExtension::ext_type)
-        .collect();
 
     let mut cipher_suites: Vec<_> = config
         .provider
@@ -333,23 +378,84 @@ fn emit_client_hello_for_retry(
     // We don't do renegotiation at all, in fact.
     cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
 
-    let mut chp = HandshakeMessagePayload {
-        typ: HandshakeType::ClientHello,
-        payload: HandshakePayload::ClientHello(ClientHelloPayload {
-            client_version: ProtocolVersion::TLSv1_2,
-            random: input.random,
-            session_id: input.session_id,
-            cipher_suites,
-            compression_methods: vec![Compression::Null],
-            extensions: exts,
-        }),
+    let mut chp_payload = ClientHelloPayload {
+        client_version: ProtocolVersion::TLSv1_2,
+        random: input.random,
+        session_id: input.session_id,
+        cipher_suites,
+        compression_methods: vec![Compression::Null],
+        extensions: exts,
     };
 
-    let early_key_schedule = if let Some(resuming) = tls13_session {
-        let schedule = tls13::fill_in_psk_binder(&resuming, &transcript_buffer, &mut chp);
-        Some((resuming.suite(), schedule))
-    } else {
-        None
+    let ech_grease_ext = config
+        .ech_mode
+        .as_ref()
+        .and_then(|mode| match mode {
+            EchMode::Grease(cfg) => Some(cfg.grease_ext(
+                config.provider.secure_random,
+                input.server_name.clone(),
+                &chp_payload,
+            )),
+            _ => None,
+        });
+
+    match (cx.data.ech_status, &mut ech_state) {
+        // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
+        // we need to replace the client hello payload with an ECH client hello payload.
+        (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state)) => {
+            // Replace the client hello payload with an ECH client hello payload.
+            chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
+            cx.data.ech_status = EchStatus::Offered;
+            // Store the ECH extension in case we need to carry it forward in a subsequent hello.
+            input.prev_ech_ext = chp_payload.extensions.last().cloned();
+        }
+        // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
+        // ECH.
+        (EchStatus::NotOffered, None) => {
+            if let Some(grease_ext) = ech_grease_ext {
+                // Add the GREASE ECH extension.
+                let grease_ext = grease_ext?;
+                chp_payload
+                    .extensions
+                    .push(grease_ext.clone());
+                cx.data.ech_status = EchStatus::Grease;
+                // Store the GREASE ECH extension in case we need to carry it forward in a
+                // subsequent hello.
+                input.prev_ech_ext = Some(grease_ext);
+            }
+        }
+        _ => {}
+    }
+
+    // Note what extensions we sent.
+    input.hello.sent_extensions = chp_payload
+        .extensions
+        .iter()
+        .map(ClientExtension::ext_type)
+        .collect();
+
+    let mut chp = HandshakeMessagePayload {
+        typ: HandshakeType::ClientHello,
+        payload: HandshakePayload::ClientHello(chp_payload),
+    };
+
+    let early_key_schedule = match (ech_state.as_mut(), tls13_session) {
+        // If we're performing ECH and resuming, then the PSK binder will have been dealt with
+        // separately, and we need to take the early_data_key_schedule computed for the inner hello.
+        (Some(ech_state), Some(tls13_session)) => ech_state
+            .early_data_key_schedule
+            .take()
+            .map(|schedule| (tls13_session.suite(), schedule)),
+
+        // When we're not doing ECH and resuming, then the PSK binder need to be filled in as
+        // normal.
+        (_, Some(tls13_session)) => Some((
+            tls13_session.suite(),
+            tls13::fill_in_psk_binder(&tls13_session, &transcript_buffer, &mut chp),
+        )),
+
+        // No early key schedule in other cases.
+        _ => None,
     };
 
     let ch = Message {
@@ -385,14 +491,24 @@ fn emit_client_hello_for_retry(
             return schedule;
         }
 
+        let (transcript_buffer, random) = match &ech_state {
+            // When using ECH the early data key schedule is derived based on the inner
+            // hello transcript and random.
+            Some(ech_state) => (
+                &ech_state.inner_hello_transcript,
+                &ech_state.inner_hello_random.0,
+            ),
+            None => (&transcript_buffer, &input.random.0),
+        };
+
         tls13::derive_early_traffic_secret(
             &*config.key_log,
             cx,
             resuming_suite,
             &schedule,
             &mut input.sent_tls13_fake_ccs,
-            &transcript_buffer,
-            &input.random.0,
+            transcript_buffer,
+            random,
         );
         schedule
     });
@@ -403,13 +519,14 @@ fn emit_client_hello_for_retry(
         early_key_schedule,
         offered_key_share: key_share,
         suite,
+        ech_state,
     };
 
-    if support_tls13 && retryreq.is_none() {
+    Ok(if support_tls13 && retryreq.is_none() {
         Box::new(ExpectServerHelloOrHelloRetryRequest { next, extra_exts })
     } else {
         Box::new(next)
-    }
+    })
 }
 
 /// Prepare resumption with the session state retrieved from storage.
@@ -698,6 +815,8 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     // We always send a key share when TLS 1.3 is enabled.
                     self.offered_key_share.unwrap(),
                     self.input.sent_tls13_fake_ccs,
+                    &m,
+                    self.ech_state,
                 )
             }
             #[cfg(feature = "tls12")]
@@ -734,7 +853,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
     }
 
     fn handle_hello_retry_request(
-        self,
+        mut self,
         cx: &mut ClientContext<'_>,
         m: Message,
     ) -> NextStateOrError<'static> {
@@ -855,9 +974,35 @@ impl ExpectServerHelloOrHelloRetryRequest {
             }
         };
 
+        // Or offers ECH related extensions when we didn't offer ECH.
+        if cx.data.ech_status == EchStatus::NotOffered && hrr.ech().is_some() {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::UnsupportedExtension,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch,
+                )
+            });
+        }
+
         // HRR selects the ciphersuite.
         cx.common.suite = Some(cs);
         cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
+
+        // If we offered ECH, we need to confirm that the server accepted it.
+        match (self.next.ech_state.as_ref(), cs.tls13()) {
+            (Some(ech_state), Some(tls13_cs)) => {
+                if !ech_state.confirm_hrr_acceptance(hrr, tls13_cs, cx.common)? {
+                    // If the server did not confirm, then note the new ECH status but
+                    // continue the handshake. We will abort with an ECH required error
+                    // at the end.
+                    cx.data.ech_status = EchStatus::Rejected;
+                }
+            }
+            (Some(_), None) => {
+                unreachable!("ECH state should only be set when TLS 1.3 was negotiated")
+            }
+            _ => {}
+        };
 
         // This is the draft19 change where the transcript became a tree
         let transcript = self
@@ -866,6 +1011,12 @@ impl ExpectServerHelloOrHelloRetryRequest {
             .start_hash(cs.hash_provider());
         let mut transcript_buffer = transcript.into_hrr_buffer();
         transcript_buffer.add_message(&m);
+
+        // If we offered ECH and the server accepted, we also need to update the separate
+        // ECH transcript with the hello retry request message.
+        if let Some(ech_state) = self.next.ech_state.as_mut() {
+            ech_state.transcript_hrr_update(cs.hash_provider(), &m);
+        }
 
         // Early data is not allowed after HelloRetryrequest
         if cx.data.early_data.is_enabled() {
@@ -889,7 +1040,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
             _ => offered_key_share,
         };
 
-        Ok(emit_client_hello_for_retry(
+        emit_client_hello_for_retry(
             transcript_buffer,
             Some(hrr),
             Some(key_share),
@@ -897,7 +1048,8 @@ impl ExpectServerHelloOrHelloRetryRequest {
             Some(cs),
             self.next.input,
             cx,
-        ))
+            self.next.ech_state,
+        )
     }
 }
 

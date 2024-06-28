@@ -101,7 +101,7 @@
 //! If you're already using Tokio for an async runtime you may prefer to use [`tokio-rustls`] instead
 //! of interacting with rustls directly.
 //!
-//! [examples]: examples/README.md
+//! [examples]: https://github.com/rustls/rustls/tree/main/examples
 //! [`tokio-rustls`]: https://github.com/rustls/tokio-rustls
 //!
 //! ### Rustls provides encrypted pipes
@@ -429,7 +429,7 @@ pub mod internal {
     /// Low-level TLS message parsing and encoding functions.
     pub mod msgs {
         pub mod base {
-            pub use crate::msgs::base::Payload;
+            pub use crate::msgs::base::{Payload, PayloadU16};
         }
         pub mod codec {
             pub use crate::msgs::codec::{Codec, Reader};
@@ -448,7 +448,7 @@ pub mod internal {
         pub mod handshake {
             pub use crate::msgs::handshake::{
                 CertificateChain, ClientExtension, ClientHelloPayload, DistinguishedName,
-                EchConfig, EchConfigContents, HandshakeMessagePayload, HandshakePayload,
+                EchConfigContents, EchConfigPayload, HandshakeMessagePayload, HandshakePayload,
                 HpkeKeyConfig, HpkeSymmetricCipherSuite, KeyShareEntry, Random, ServerName,
                 SessionId,
             };
@@ -514,8 +514,8 @@ pub use crate::enums::{
     ProtocolVersion, SignatureAlgorithm, SignatureScheme,
 };
 pub use crate::error::{
-    CertRevocationListError, CertificateError, Error, InvalidMessage, OtherError, PeerIncompatible,
-    PeerMisbehaved,
+    CertRevocationListError, CertificateError, EncryptedClientHelloError, Error, InvalidMessage,
+    OtherError, PeerIncompatible, PeerMisbehaved,
 };
 pub use crate::key_log::{KeyLog, NoKeyLog};
 #[cfg(feature = "std")]
@@ -542,6 +542,7 @@ pub mod client {
     pub(super) mod builder;
     mod client_conn;
     mod common;
+    mod ech;
     pub(super) mod handy;
     mod hs;
     #[cfg(feature = "tls12")]
@@ -555,6 +556,7 @@ pub mod client {
     };
     #[cfg(feature = "std")]
     pub use client_conn::{ClientConnection, WriteEarlyData};
+    pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ClientSessionMemoryCache;
 

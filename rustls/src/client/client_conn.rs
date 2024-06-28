@@ -9,6 +9,7 @@ use pki_types::{ServerName, UnixTime};
 use super::handy::NoClientSessionStorage;
 use super::hs;
 use crate::builder::ConfigBuilder;
+use crate::client::{EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
 use crate::crypto::{CryptoProvider, SupportedKxGroup};
@@ -134,6 +135,12 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder_with_provider()`]
 /// function.
 ///
+/// Note that using [`ConfigBuilder<ClientConfig, WantsVersions>::with_ech()`] will produce a common
+/// configuration specific to the provided [`crate::client::EchConfig`] that may not be appropriate
+/// for all connections made by the program. In this case the configuration should only be shared
+/// by connections intended for domains that offer the provided [`crate::client::EchConfig`] in
+/// their DNS zone.
+///
 /// # Defaults
 ///
 /// * [`ClientConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
@@ -248,6 +255,9 @@ pub struct ClientConfig {
     /// This is optional: [`compress::CompressionCache::Disabled`] gives
     /// a cache that does no caching.
     pub cert_compression_cache: Arc<compress::CompressionCache>,
+
+    /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
+    pub(super) ech_mode: Option<EchMode>,
 }
 
 impl ClientConfig {
@@ -339,17 +349,20 @@ impl ClientConfig {
     ///
     /// This is different from [`CryptoProvider::fips()`]: [`CryptoProvider::fips()`]
     /// is concerned only with cryptography, whereas this _also_ covers TLS-level
-    /// configuration that NIST recommends.
+    /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
     pub fn fips(&self) -> bool {
+        let mut is_fips = self.provider.fips();
+
         #[cfg(feature = "tls12")]
         {
-            self.provider.fips() && self.require_ems
+            is_fips = is_fips && self.require_ems
         }
 
-        #[cfg(not(feature = "tls12"))]
-        {
-            self.provider.fips()
+        if let Some(ech_mode) = &self.ech_mode {
+            is_fips = is_fips && ech_mode.fips();
         }
+
+        is_fips
     }
 
     /// Return the crypto provider used to construct this client configuration.
@@ -599,6 +612,7 @@ mod connection {
     use pki_types::ServerName;
 
     use super::ClientConnectionData;
+    use crate::client::EchStatus;
     use crate::common_state::Protocol;
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
@@ -717,6 +731,20 @@ mod connection {
             self.inner.dangerous_extract_secrets()
         }
 
+        /// Return the connection's Encrypted Client Hello (ECH) status.
+        pub fn ech_status(&self) -> EchStatus {
+            self.inner.core.data.ech_status
+        }
+
+        /// Return true if the connection was made with a `ClientConfig` that is FIPS compatible.
+        ///
+        /// This is different from [`crate::crypto::CryptoProvider::fips()`]:
+        /// it is concerned only with cryptography, whereas this _also_ covers TLS-level
+        /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
+        pub fn fips(&self) -> bool {
+            self.inner.core.data.fips
+        }
+
         fn write_early_data(&mut self, data: &[u8]) -> io::Result<usize> {
             self.inner
                 .core
@@ -778,6 +806,7 @@ impl ConnectionCore<ClientConnectionData> {
         common_state.protocol = proto;
         common_state.enable_secret_extraction = config.enable_secret_extraction;
         let mut data = ClientConnectionData::new();
+        data.fips = config.fips();
 
         let mut cx = hs::ClientContext {
             common: &mut common_state,
@@ -913,6 +942,8 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) resumption_ciphersuite: Option<SupportedCipherSuite>,
+    pub(super) ech_status: EchStatus,
+    pub(super) fips: bool,
 }
 
 impl ClientConnectionData {
@@ -920,6 +951,8 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             resumption_ciphersuite: None,
+            ech_status: EchStatus::NotOffered,
+            fips: false,
         }
     }
 }

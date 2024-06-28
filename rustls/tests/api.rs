@@ -21,19 +21,29 @@ use rustls::client::{verify_server_cert_signed_by_trust_anchor, ResolvesClientCe
 use rustls::crypto::CryptoProvider;
 use rustls::internal::msgs::base::Payload;
 use rustls::internal::msgs::codec::Codec;
-use rustls::internal::msgs::enums::AlertLevel;
+use rustls::internal::msgs::enums::{AlertLevel, Compression};
 use rustls::internal::msgs::handshake::{
-    ClientExtension, HandshakeMessagePayload, HandshakePayload,
-    ServerName as ServerNameExtensionItem,
+    ClientExtension, ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, Random,
+    ServerName as ServerNameExtensionItem, SessionId,
 };
-use rustls::internal::msgs::message::{Message, MessagePayload};
+use rustls::internal::msgs::message::{Message, MessagePayload, PlainMessage};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+#[cfg(feature = "aws_lc_rs")]
+use rustls::{
+    client::{EchConfig, EchGreaseConfig, EchMode},
+    crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+    internal::msgs::base::PayloadU16,
+    internal::msgs::handshake::{
+        EchConfigPayload, EchConfigContents, HpkeKeyConfig, HpkeSymmetricCipherSuite,
+    },
+    pki_types::{DnsName, EchConfigListBytes},
+};
 use rustls::{
     sign, AlertDescription, CertificateError, CipherSuite, ClientConfig, ClientConnection,
     ConnectionCommon, ConnectionTrafficSecrets, ContentType, DistinguishedName, Error,
-    HandshakeKind, InvalidMessage, KeyLog, PeerIncompatible, PeerMisbehaved, ProtocolVersion,
-    ServerConfig, ServerConnection, SideData, SignatureScheme, Stream, StreamOwned,
-    SupportedCipherSuite,
+    HandshakeKind, HandshakeType, InvalidMessage, KeyLog, PeerIncompatible, PeerMisbehaved,
+    ProtocolVersion, ServerConfig, ServerConnection, SideData, SignatureScheme, Stream,
+    StreamOwned, SupportedCipherSuite,
 };
 
 use super::*;
@@ -4392,7 +4402,7 @@ mod test_quic {
         let random = Random::from(random);
 
         let rng = ring::rand::SystemRandom::new();
-        let kx = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
+        let kx = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng)
             .unwrap()
             .compute_public_key()
             .unwrap();
@@ -4407,10 +4417,10 @@ mod test_quic {
                 compression_methods: vec![Compression::Null],
                 extensions: vec![
                     ClientExtension::SupportedVersions(vec![ProtocolVersion::TLSv1_3]),
-                    ClientExtension::NamedGroups(vec![NamedGroup::X25519]),
+                    ClientExtension::NamedGroups(vec![NamedGroup::secp256r1]),
                     ClientExtension::SignatureAlgorithms(vec![SignatureScheme::ED25519]),
                     ClientExtension::KeyShare(vec![KeyShareEntry::new(
-                        NamedGroup::X25519,
+                        NamedGroup::secp256r1,
                         kx.as_ref(),
                     )]),
                 ],
@@ -4996,10 +5006,10 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     // common to both client configs
     let shared_storage = Arc::new(ClientStorage::new());
 
-    // first, client sends a x25519 and server agrees. x25519 is inserted
+    // first, client sends a secp-256 share and server agrees. secp-256 is inserted
     //   into kx group cache.
     let mut client_config_1 =
-        make_client_config_with_kx_groups(KeyType::Rsa2048, vec![provider::kx_group::X25519]);
+        make_client_config_with_kx_groups(KeyType::Rsa2048, vec![provider::kx_group::SECP256R1]);
     client_config_1.resumption = Resumption::store(shared_storage.clone());
 
     // second, client only supports secp-384 and so kx group cache
@@ -5019,7 +5029,7 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     assert_eq!(ops.len(), 9);
     assert!(matches!(
         ops[3],
-        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::X25519)
+        ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp256r1)
     ));
 
     // second handshake
@@ -5032,7 +5042,7 @@ fn test_client_attempts_to_use_unsupported_kx_group() {
     assert!(matches!(ops[9], ClientStorageOp::TakeTls13Ticket(_, true)));
     assert!(matches!(
         ops[10],
-        ClientStorageOp::GetKxHint(_, Some(rustls::NamedGroup::X25519))
+        ClientStorageOp::GetKxHint(_, Some(rustls::NamedGroup::secp256r1))
     ));
     assert!(matches!(
         ops[11],
@@ -5063,7 +5073,8 @@ fn test_client_sends_share_for_less_preferred_group() {
     );
     client_config_2.resumption = Resumption::store(shared_storage.clone());
 
-    let server_config = make_server_config(KeyType::Rsa2048);
+    let server_config =
+        make_server_config_with_kx_groups(KeyType::Rsa2048, provider::ALL_KX_GROUPS.to_vec());
 
     // first handshake
     let (mut client_1, mut server) = make_pair_for_configs(client_config_1, server_config.clone());
@@ -5632,11 +5643,20 @@ fn test_client_with_custom_verifier_can_accept_ecdsa_sha1_signatures() {
         Altered::InPlace
     }
 
-    let client_config = client_config_builder_with_versions(&[&rustls::version::TLS12])
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(MockServerVerifier::accepts_anything()))
-        .with_no_client_auth();
-    let server_config = make_server_config(KeyType::EcdsaP256);
+    let kx_groups = provider::ALL_KX_GROUPS;
+    let client_config = ClientConfig::builder_with_provider(
+        CryptoProvider {
+            kx_groups: kx_groups.to_vec(),
+            ..provider::default_provider()
+        }
+        .into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(MockServerVerifier::accepts_anything()))
+    .with_no_client_auth();
+    let server_config = make_server_config_with_kx_groups(KeyType::EcdsaP256, kx_groups.to_vec());
     let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
     transfer(&mut client, &mut server);
     server.process_new_packets().unwrap();
@@ -6341,6 +6361,58 @@ fn test_server_fips_service_indicator_includes_require_ems() {
     assert!(!server_config.fips());
 }
 
+#[cfg(feature = "aws_lc_rs")]
+#[test]
+fn test_client_fips_service_indicator_includes_ech_hpke_suite() {
+    if !provider_is_fips() {
+        return;
+    }
+
+    for suite in ALL_SUPPORTED_SUITES {
+        let (public_key, _) = suite.generate_key_pair().unwrap();
+
+        let suite_id = suite.suite();
+        let bogus_config = EchConfigPayload::V18(EchConfigContents {
+            key_config: HpkeKeyConfig {
+                config_id: 10,
+                kem_id: suite_id.kem,
+                public_key: PayloadU16(public_key.0.clone()),
+                symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                    kdf_id: suite_id.sym.kdf_id,
+                    aead_id: suite_id.sym.aead_id,
+                }],
+            },
+            maximum_name_length: 0,
+            public_name: DnsName::try_from("example.com").unwrap(),
+            extensions: vec![],
+        });
+        let mut bogus_config_bytes = Vec::new();
+        vec![bogus_config].encode(&mut bogus_config_bytes);
+        let ech_config =
+            EchConfig::new(EchConfigListBytes::from(bogus_config_bytes), &[*suite]).unwrap();
+
+        // A ECH client configuration should only be considered FIPS approved if the
+        // ECH HPKE suite is itself FIPS approved.
+        let config = ClientConfig::builder_with_provider(provider::default_provider().into())
+            .with_ech(EchMode::Enable(ech_config))
+            .unwrap();
+        let config = finish_client_config(KeyType::Rsa2048, config);
+        assert_eq!(config.fips(), suite.fips());
+
+        // The same applies if an ECH GREASE client configuration is used.
+        let config = ClientConfig::builder_with_provider(provider::default_provider().into())
+            .with_ech(EchMode::Grease(EchGreaseConfig::new(*suite, public_key)))
+            .unwrap();
+        let config = finish_client_config(KeyType::Rsa2048, config);
+        assert_eq!(config.fips(), suite.fips());
+
+        // And a connection made from a client config should retain the fips status of the
+        // config w.r.t the HPKE suite.
+        let conn = ClientConnection::new(config.into(), ServerName::DnsName(DnsName::try_from("example.org").unwrap())).unwrap();
+        assert_eq!(conn.fips(), suite.fips());
+    }
+}
+
 #[test]
 fn test_complete_io_errors_if_close_notify_received_too_early() {
     let mut server = ServerConnection::new(Arc::new(make_server_config(KeyType::Rsa2048))).unwrap();
@@ -6880,6 +6952,155 @@ impl<'a> io::Write for FakeStream<'a> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn test_illegal_server_renegotiation_attempt_after_tls13_handshake() {
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13]);
+    let mut server_config = make_server_config(KeyType::Rsa2048);
+    server_config.enable_secret_extraction = true;
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let mut raw_server = RawTls::new_server(server);
+
+    let msg = PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_3,
+        payload: Payload::new(
+            HandshakeMessagePayload {
+                typ: HandshakeType::HelloRequest,
+                payload: HandshakePayload::HelloRequest,
+            }
+            .get_encoding(),
+        ),
+    };
+    raw_server.encrypt_and_send(&msg, &mut client);
+    let err = client
+        .process_new_packets()
+        .unwrap_err();
+    assert_eq!(
+        err,
+        Error::InappropriateHandshakeMessage {
+            expect_types: vec![HandshakeType::NewSessionTicket, HandshakeType::KeyUpdate],
+            got_type: HandshakeType::HelloRequest
+        }
+    );
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn test_illegal_server_renegotiation_attempt_after_tls12_handshake() {
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS12]);
+    let mut server_config = make_server_config(KeyType::Rsa2048);
+    server_config.enable_secret_extraction = true;
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let mut raw_server = RawTls::new_server(server);
+
+    let msg = PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_3,
+        payload: Payload::new(
+            HandshakeMessagePayload {
+                typ: HandshakeType::HelloRequest,
+                payload: HandshakePayload::HelloRequest,
+            }
+            .get_encoding(),
+        ),
+    };
+
+    // one is allowed (and elicits a warning alert)
+    raw_server.encrypt_and_send(&msg, &mut client);
+    client.process_new_packets().unwrap();
+    raw_server.receive_and_decrypt(&mut client, |m| {
+        assert_eq!(format!("{m:?}"),
+                   "Message { version: TLSv1_2, payload: Alert(AlertMessagePayload { level: Warning, description: NoRenegotiation }) }");
+    });
+
+    // second is fatal
+    raw_server.encrypt_and_send(&msg, &mut client);
+    assert_eq!(
+        client
+            .process_new_packets()
+            .unwrap_err(),
+        Error::PeerMisbehaved(PeerMisbehaved::TooManyRenegotiationRequests)
+    );
+}
+
+#[test]
+fn test_illegal_client_renegotiation_attempt_after_tls13_handshake() {
+    let mut client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13]);
+    client_config.enable_secret_extraction = true;
+    let server_config = make_server_config(KeyType::Rsa2048);
+
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+
+    let mut raw_client = RawTls::new_client(client);
+
+    let msg = PlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_3,
+        payload: Payload::new(
+            HandshakeMessagePayload {
+                typ: HandshakeType::ClientHello,
+                payload: HandshakePayload::ClientHello(ClientHelloPayload {
+                    client_version: ProtocolVersion::TLSv1_2,
+                    random: Random::from([0u8; 32]),
+                    session_id: SessionId::read_bytes(&[0u8]).unwrap(),
+                    cipher_suites: vec![],
+                    compression_methods: vec![Compression::Null],
+                    extensions: vec![ClientExtension::ExtendedMasterSecretRequest],
+                }),
+            }
+            .get_encoding(),
+        ),
+    };
+    raw_client.encrypt_and_send(&msg, &mut server);
+    let err = server
+        .process_new_packets()
+        .unwrap_err();
+    assert_eq!(
+        format!("{err:?}"),
+        "InappropriateHandshakeMessage { expect_types: [KeyUpdate], got_type: ClientHello }"
+    );
+}
+
+#[cfg(feature = "tls12")]
+#[test]
+fn test_illegal_client_renegotiation_attempt_during_tls12_handshake() {
+    let server_config = make_server_config(KeyType::Rsa2048);
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS12]);
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+
+    let mut client_hello = vec![];
+    client
+        .write_tls(&mut io::Cursor::new(&mut client_hello))
+        .unwrap();
+
+    server
+        .read_tls(&mut io::Cursor::new(&client_hello))
+        .unwrap();
+    server
+        .read_tls(&mut io::Cursor::new(&client_hello))
+        .unwrap();
+    assert_eq!(
+        server
+            .process_new_packets()
+            .unwrap_err(),
+        Error::InappropriateHandshakeMessage {
+            expect_types: vec![HandshakeType::ClientKeyExchange],
+            got_type: HandshakeType::ClientHello
+        }
+    );
 }
 
 } // test_for_each_provider!
